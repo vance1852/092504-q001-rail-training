@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import uuid
 from typing import Any, Callable
 
@@ -11,6 +12,7 @@ from .audit import append_event, canonical_json, digest, verify_chain
 from .clock import Clock, SystemClock
 from .domain import is_allowed_category
 from .errors import ConflictError, NotFoundError, PermissionDenied, ValidationError
+from .idempotency import idempotent
 from .models import Actor, DomainRecord, Site, WriteReceipt
 from .storage import Database
 
@@ -57,19 +59,28 @@ class DomainService:
     def _idempotent(self, connection, *, request_id: str, action: str,
                     payload: dict[str, Any], create: Callable[[], tuple[str, str, dict[str, Any]]]) -> WriteReceipt:
         request_id = self._identifier(request_id, "request_id")
-        payload_hash = digest(payload)
-        row = connection.execute("SELECT * FROM request_receipts WHERE request_id=?", (request_id,)).fetchone()
-        if row:
-            if row["action"] != action or row["payload_hash"] != payload_hash:
-                raise ConflictError("request_id 已被不同内容使用")
-            return WriteReceipt(request_id, row["resource_type"], row["resource_id"], True)
-        resource_type, resource_id, response = create()
-        connection.execute(
-            "INSERT INTO request_receipts(request_id,action,payload_hash,resource_type,resource_id,response_json,created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (request_id, action, payload_hash, resource_type, resource_id, canonical_json(response), self._now()),
-        )
-        return WriteReceipt(request_id, resource_type, resource_id, False)
+        try:
+            return idempotent(connection, request_id=request_id, action=action,
+                              payload=payload, now=self._now, create=create)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("request_id 已被不同内容使用") from exc
+
+    def _replay_if_seen(self, connection, *, request_id: str, action: str,
+                        payload: dict[str, Any]) -> WriteReceipt | None:
+        """在当前状态校验之前识别回执重放，保证重放结果确定。
+
+        返回 None 表示该 request_id 首次出现；编号被不同动作或内容复用时抛冲突。
+        """
+
+        request_id = self._identifier(request_id, "request_id")
+        row = connection.execute(
+            "SELECT * FROM request_receipts WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["action"] != action or row["payload_hash"] != digest(payload):
+            raise ConflictError("request_id 已被不同内容使用")
+        return WriteReceipt(request_id, row["resource_type"], row["resource_id"], True)
 
     def register_organization(self, *, request_id: str, actor_id: str,
                               organization_id: str, name: str) -> WriteReceipt:
@@ -209,10 +220,11 @@ class DomainService:
                                     action="record_domain_data", payload=payload, create=create)
 
     def get_site(self, site_id: str) -> Site:
-        row = self.database.connection.execute("SELECT * FROM sites WHERE site_id=?", (site_id,)).fetchone()
-        if row is None:
-            raise NotFoundError("场所不存在")
-        return Site(row["site_id"], row["organization_id"], row["name"], row["timezone_name"], row["version"])
+        with self.database.lock:
+            row = self.database.connection.execute("SELECT * FROM sites WHERE site_id=?", (site_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("场所不存在")
+            return Site(row["site_id"], row["organization_id"], row["name"], row["timezone_name"], row["version"])
 
     def list_domain_data(self, site_id: str, category: str | None = None) -> list[DomainRecord]:
         parameters: list[Any] = [site_id]
@@ -222,16 +234,19 @@ class DomainService:
             parameters.append(category)
         query += " ORDER BY created_at, record_id"
         records = []
-        for row in self.database.connection.execute(query, parameters):
+        with self.database.lock:
+            rows = self.database.connection.execute(query, parameters).fetchall()
+        for row in rows:
             records.append(DomainRecord(row["record_id"], row["site_id"], row["category"],
                                         row["external_key"], json.loads(row["payload_json"]),
                                         row["created_by"], row["created_at"]))
         return records
 
     def audit_events(self, after_sequence: int = 0) -> list[dict[str, Any]]:
-        rows = self.database.connection.execute(
-            "SELECT * FROM audit_events WHERE sequence>? ORDER BY sequence", (after_sequence,)
-        ).fetchall()
+        with self.database.lock:
+            rows = self.database.connection.execute(
+                "SELECT * FROM audit_events WHERE sequence>? ORDER BY sequence", (after_sequence,)
+            ).fetchall()
         return [{"sequence": row["sequence"], "event_id": row["event_id"], "actor_id": row["actor_id"],
                  "action": row["action"], "resource_type": row["resource_type"],
                  "resource_id": row["resource_id"], "detail": json.loads(row["detail_json"]),
@@ -239,4 +254,5 @@ class DomainService:
                  "occurred_at": row["occurred_at"]} for row in rows]
 
     def verify_audit(self) -> tuple[bool, int]:
-        return verify_chain(self.database.connection)
+        with self.database.lock:
+            return verify_chain(self.database.connection)
